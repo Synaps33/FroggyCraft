@@ -3,7 +3,6 @@
 ClassiCube running on the **SF2000 / GB300** handheld, with gamepad-only controls
 and no firmware modifications.
 
-![controls and graphics](docs/screenshot.png)
 
 ## What this is
 

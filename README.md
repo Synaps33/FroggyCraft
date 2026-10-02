@@ -11,6 +11,11 @@ SF2000/GB300: a 320x240 MIPS32 handheld with no FPU, no mouse and no keyboard.
 Everything the game normally expects from a keyboard and a mouse is mapped onto
 the gamepad, including the settings menu.
 
+
+
+## Bugs
+No Sound
+
 ## Releases
 
 Prebuilt, plug-and-play packages are attached to the

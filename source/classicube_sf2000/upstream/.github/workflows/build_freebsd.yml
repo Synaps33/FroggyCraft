@@ -1,0 +1,94 @@
+name: Build latest (FreeBSD)
+# trigger via either push to selected branches or on manual run
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}-freebsd
+  cancel-in-progress: true
+
+jobs:
+  build:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    container:
+      image: empterdose/freebsd-cross-build:11.4
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install prerequisites
+        run: apk add bash wget curl
+
+      - name: Retrieve OpenGL and X11 dev files (64 bit)
+        run: |
+          wget https://github.com/ClassiCube/rpi-compiling-stuff/raw/main/freebsd64.zip
+          unzip freebsd64.zip -d freebsd64
+
+      - name: Retrieve OpenGL and X11 dev files (32 bit)
+        run: |
+          wget https://github.com/ClassiCube/rpi-compiling-stuff/raw/main/freebsd32.zip
+          unzip freebsd32.zip -d freebsd32
+
+      - name: Compile FreeBSD 64 bit build
+        shell: bash
+        run: |
+          LATEST_FLAG=-DCC_COMMIT_SHA=\\\"${GITHUB_SHA::9}\\\"
+
+          COMMON_CFLAGS="-fno-stack-protector -fno-pie -fcf-protection=none $LATEST_FLAG"
+          COMMON_LDFLAGS="-s -L freebsd64/lib"
+
+          make freebsd dist RELEASE=1 TARGET=cc-fbsd64-gl1 CC=x86_64-freebsd11-clang \
+                EXTRA_CFLAGS="$COMMON_CFLAGS" \
+                EXTRA_LDFLAGS="$COMMON_LDFLAGS"
+
+      - name: Compile FreeBSD 32 bit build
+        shell: bash
+        run: |
+          make freebsd clean
+          LATEST_FLAG=-DCC_COMMIT_SHA=\\\"${GITHUB_SHA::9}\\\"
+
+          COMMON_CFLAGS="-fno-stack-protector -fno-pie -fcf-protection=none $LATEST_FLAG"
+          COMMON_LDFLAGS="-s -L freebsd32/lib"
+
+          make freebsd dist RELEASE=1 TARGET=cc-fbsd32-gl1 CC=i386-freebsd11-clang \
+                EXTRA_CFLAGS="$COMMON_CFLAGS" \
+                EXTRA_LDFLAGS="$COMMON_LDFLAGS"
+          
+          
+      - uses: ./.github/actions/upload_build
+        with:
+          SOURCE_FILE: 'cc-fbsd32-gl1'
+          DEST_NAME: 'ClassiCube-FreeBSD-32'
+          
+      - uses: ./.github/actions/upload_build
+        with:
+          SOURCE_FILE: 'cc-fbsd64-gl1'
+          DEST_NAME: 'ClassiCube-FreeBSD-64'
+
+
+      - uses: ./.github/actions/upload_build
+        with:
+          SOURCE_FILE: 'cc-fbsd32-gl1.tar.gz'
+          DEST_NAME: 'ClassiCube-freebsd32.tar.gz'
+      
+      - uses: ./.github/actions/upload_build
+        with:
+          SOURCE_FILE: 'cc-fbsd64-gl1.tar.gz'
+          DEST_NAME: 'ClassiCube-freebsd64.tar.gz'
+          
+          
+      - uses: ./.github/actions/notify_success
+        with:
+          DESTINATION_URL: '${{ secrets.NOTIFY_URL }}'
+          WORKFLOW_NAME: 'freebsd'
+
+
+      - uses: ./.github/actions/notify_failure
+        if: failure()
+        with:
+          NOTIFY_MESSAGE: 'Failed to produce FreeBSD build(s)'
+          WEBHOOK_URL: '${{ secrets.WEBHOOK_URL }}'

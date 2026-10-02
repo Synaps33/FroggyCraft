@@ -1,0 +1,1038 @@
+#define CC_DYNAMIC_VBS_ARE_STATIC
+#define CC_SCRATCH_VBS_ARE_DYNAMIC
+#include "../_GraphicsBase.h"
+#include "../Errors.h"
+#include "../Logger.h"
+#include "../Window.h"
+#include "../_BlockAlloc.h"
+
+#include <malloc.h>
+#include <pspkernel.h>
+#include <pspdisplay.h>
+#include <pspdebug.h>
+#include <pspctrl.h>
+#include <pspgu.h>
+#include "ge_gpu.h"
+
+#define BUFFER_WIDTH  512
+#define SCREEN_WIDTH  480
+#define SCREEN_HEIGHT 272
+
+#define GB_HALF  2048
+#define GB_RANGE 4096
+
+#define FB_SIZE (BUFFER_WIDTH * SCREEN_HEIGHT * 4)
+#define ZB_SIZE (BUFFER_WIDTH * SCREEN_HEIGHT * 2)
+
+static unsigned int CC_ALIGNED(16) list[262144];
+static cc_uint8* gfx_vertices;
+static int gfx_fields;
+
+struct Plane { float a, b, c, d; } CC_ALIGNED(16);
+
+// https://www.ppsspp.org/docs/psp-hardware/gpu/ge-overview
+// https://www.ppsspp.org/docs/psp-hardware/gpu/ge-vertex-pipeline
+// https://github.com/pspdev/pspsdk/blob/master/src/gu/doc/commands.txt
+
+
+/*########################################################################################################################*
+*---------------------------------------------------------General---------------------------------------------------------*
+*#########################################################################################################################*/
+static int formatFields[] = {
+	GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D,
+	GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D
+};
+
+static void guInit(void) {
+	void* framebuffer0 = (void*)0;
+	void* framebuffer1 = (void*)FB_SIZE;
+	void* depthbuffer  = (void*)(FB_SIZE + FB_SIZE);
+	
+	sceGuInit();
+	sceGuStart(GU_DIRECT, list);
+	sceGuDrawBuffer(GU_PSM_8888, framebuffer0, BUFFER_WIDTH);
+	sceGuDispBuffer(SCREEN_WIDTH, SCREEN_HEIGHT, framebuffer1, BUFFER_WIDTH);
+	sceGuDepthBuffer(depthbuffer, BUFFER_WIDTH);
+	
+	sceGuFrontFace(GU_CCW);
+	sceGuShadeModel(GU_SMOOTH);
+	GE_set_texturing(false);
+	
+	sceGuAlphaFunc(GU_GREATER, 0x7f, 0xff);
+	sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+	sceGuDepthFunc(GU_LEQUAL); // sceGuDepthFunc(GU_GEQUAL);
+	GE_set_viewport_z(0, 65535); // GE_set_viewport_z(65535, 0);
+
+	GE_set_depth_range(0, 65535);
+	GE_upload_world_matrix((const float*)&Matrix_Identity);
+	
+	sceGuEnable(GU_CLIP_PLANES); // TODO: swap near/far instead of this?
+	sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
+
+	Gfx_OnWindowResize(Game.Width, Game.Height);
+	sceGuClutMode(GU_PSM_8888, 0, 0xFF, 0); // 32 bit CLUT entries
+	
+	sceGuFinish();
+	sceGeDrawSync(GU_SYNC_WAIT); // waits until FINISH command is reached
+	sceDisplayWaitVblankStart();
+	sceGuDisplay(GU_TRUE);
+}
+
+extern void Clip_SetGuardbandScale(const float* x, const float* y);
+static void InitGuardband(void) {
+	// PSP clipping guard band ranges from 0..GB_RANGE
+	// - 0 < screen_x < GB_RANGE
+	// - 0 < VIEWPORT(X/W) + WINDOW_OFFSET_X < GB_RANGE
+	// - 0 < ((X/W) * vp_hwidth + vp_x + vp_hwidth) + (GB_HALF-vp_hwidth) < GB_RANGE
+	// - 0 <  (X/W) * vp_hwidth + vp_x              +  GB_HALF            < GB_RANGE
+	// Although accurately rescaling from viewport range to guard band range
+	//  would involve vp_x and vp_hwidth, this complicates the calculation
+	//  as e.g. a non-zero vp_x means viewport is not equally distant from the
+	//  left and right guardband planes.
+	// So to simplify calculation, just set viewport = screen size for clipping:
+	// - 0 < (X/W) * SCR_HWIDTH + (GB_HALF) < GB_RANGE
+	// - -GB_HALF < (X/W) * SCR_HWIDTH < GB_HALF 
+	// - -GB_HALF/SCR_HWIDTH < (X/W) < GB_HALF/SCR_HWIDTH
+	// - W * -GB_HALF/SCR_HWIDTH < X < W * GB_HALF/SCR_HWIDTH
+	// - -W < X / (GB_HALF/SCR_HWIDTH) < W
+	// - -W < X * (SCR_HWIDTH/GB_HALF) < W
+	// Clipping against guardband instead of view frustum reduces the
+	//   number of triangles that go through the slower 'clipping' codepath
+	float scaleX =  (SCREEN_WIDTH /2) / 2047.0f;
+	float scaleY = -(SCREEN_HEIGHT/2) / 2047.0f;
+	Clip_SetGuardbandScale(&scaleX, &scaleY);
+}
+
+static GfxResourceID white_square;
+void Gfx_Create(void) {
+	if (!Gfx.Created) guInit();
+	
+	Gfx.MinTexWidth  = 2;
+	Gfx.MinTexHeight = 2;
+	Gfx.MaxTexWidth  = 512;
+	Gfx.MaxTexHeight = 512;
+	Gfx.NonPowTwoTexturesSupport = GFX_NONPOW2_UPLOAD;
+	Gfx.Created      = true;
+	gfx_vsync        = true;
+
+	last_base = -1;
+	InitGuardband();
+}
+
+void Gfx_Free(void) { 
+	Gfx_FreeState();
+}
+
+cc_bool Gfx_TryRestoreContext(void) { return true; }
+
+static void Gfx_RestoreState(void) {
+	InitDefaultResources();
+	
+	// 4x4 dummy white texture
+	struct Bitmap bmp;
+	BitmapCol pixels[4 * 4];
+	Mem_Set(pixels, 0xFF, sizeof(pixels));
+	Bitmap_Init(bmp, 4, 4, pixels);
+	white_square = Gfx_CreateTexture(&bmp, 0, false);
+}
+
+static void Gfx_FreeState(void) {
+	FreeDefaultResources(); 
+	Gfx_DeleteTexture(&white_square);
+}
+
+
+/*########################################################################################################################*
+*----------------------------------------------------------Frustum--------------------------------------------------------*
+*#########################################################################################################################*/
+extern cc_bool Frustum_SphereSkipsClipping(float x, float y, float z, float radius);
+
+cc_bool Gfx_CanSphereSkipClipping(float x, float y, float z, float radius) {
+	return Frustum_SphereSkipsClipping(x, y, z, radius);
+}
+
+/*struct Plane_ { float a, b, c, d; };
+struct FrustumPlanes { struct Plane_ L, R, B, T, F; };
+extern struct FrustumPlanes frustum;
+
+cc_bool Gfx_CanSphereSkipClipping(float x, float y, float z, float radius) {
+	float d;
+
+	d = frustum.L.a * x + frustum.L.b * y + frustum.L.c * z + frustum.L.d;
+	Platform_Log2("L %f3 < %f3", &d, &radius);
+	if (d < radius) return false;
+
+	d = frustum.R.a * x + frustum.R.b * y + frustum.R.c * z + frustum.R.d;
+	Platform_Log2("R %f3 < %f3", &d, &radius);
+	if (d < radius) return false;
+
+	d = frustum.B.a * x + frustum.B.b * y + frustum.B.c * z + frustum.B.d;
+	Platform_Log2("B %f3 < %f3", &d, &radius);
+	if (d < radius) return false;
+
+	d = frustum.T.a * x + frustum.T.b * y + frustum.T.c * z + frustum.T.d;
+	Platform_Log2("T %f3 < %f3", &d, &radius);
+	if (d < radius) return false;
+
+	d = frustum.F.a * x + frustum.F.b * y + frustum.F.c * z + frustum.F.d;
+	Platform_Log2("F %f3 < %f3", &d, &radius);
+	if (d < radius) return false;
+
+	return true;
+}*/
+
+
+/*########################################################################################################################*
+*------------------------------------------------------Texture memory-----------------------------------------------------*
+*#########################################################################################################################*/
+#define VRAM_SIZE (2 * 1024 * 1024)
+#define ALL_BUFFERS_SIZE (FB_SIZE + FB_SIZE + ZB_SIZE)
+#define TEXMEM_TOTAL_FREE (VRAM_SIZE - ALL_BUFFERS_SIZE)
+
+#define TEXMEM_BLOCK_SIZE 1024
+#define TEXMEM_MAX_BLOCKS (TEXMEM_TOTAL_FREE / TEXMEM_BLOCK_SIZE)
+static cc_uint8 tex_table[TEXMEM_MAX_BLOCKS / BLOCKS_PER_PAGE];
+static int CLIPPED, MACLIPPED, UNCLIPPED;
+
+
+/*########################################################################################################################*
+*---------------------------------------------------------Palettes--------------------------------------------------------*
+*#########################################################################################################################*/
+#define MAX_PAL_4BPP_ENTRIES 16
+
+static CC_INLINE int FindInPalette(BitmapCol* palette, int pal_count, BitmapCol color) {
+	for (int i = 0; i < pal_count; i++) 
+	{
+		if (palette[i] == color) return i;
+	}
+	return -1;
+}
+
+static int CalcPalette(BitmapCol* palette, struct Bitmap* bmp, int rowWidth) {
+	int width = bmp->width, height = bmp->height;
+
+	BitmapCol* row = bmp->scan0;
+	int pal_count  = 0;
+	
+	for (int y = 0; y < height; y++, row += rowWidth)
+	{
+		for (int x = 0; x < width; x++) 
+		{
+			BitmapCol color = row[x];
+			int idx = FindInPalette(palette, pal_count, color);
+			if (idx >= 0) continue;
+
+			// Too many distinct colours
+			if (pal_count >= MAX_PAL_4BPP_ENTRIES) return 0;
+
+			palette[pal_count] = color;
+			pal_count++;
+		}
+	}
+	return pal_count;
+}
+
+
+/*########################################################################################################################*
+*---------------------------------------------------------Swizzling-------------------------------------------------------*
+*#########################################################################################################################*/
+// PSP swizzled textures are 16 bytes X 8 rows 
+//  = 4 '32 bit' pixels X 8 rows
+//  = 16 '8 bit' pixels X 8 rows
+//  = 32 '4 bit' pixels X 8 rows
+static CC_INLINE void TwiddleCalcFactors(unsigned w, unsigned h, unsigned* maskX, unsigned* maskY) {
+	*maskX = 0b00000011; // 2 linear X bits
+	*maskY = 0b00011100; // 3 linear Y bits
+
+	// Adjust for lower 2 X and 3 Y linear bits
+	w >>= (2 + 1);
+	h >>= (3 + 1);
+	int shift = 2 + 3;
+
+	for (; w > 0; w >>= 1) {
+		*maskX += 0x01 << shift;
+		shift  += 1;
+	}
+
+	for (; h > 0; h >>= 1) {
+		*maskY += 0x01 << shift;
+		shift  += 1;
+	}
+}
+
+// Since can only address at byte level, each "byte" has two "4 bit" pixels in it
+// Therefore the calculation below is for "8 bit pixels", but is called with w divided by 2
+static CC_INLINE void TwiddleCalcFactors_Paletted(unsigned w, unsigned h, unsigned* maskX, unsigned* maskY) {
+	*maskX = 0b00001111; // 4 linear X bits
+	*maskY = 0b01110000; // 3 linear Y bits
+
+	// Adjust for lower 4 X and 3 Y linear bits
+	w >>= (4 + 1);
+	h >>= (3 + 1);
+	int shift = 4 + 3;
+
+	for (; w > 0; w >>= 1) {
+		*maskX += 0x01 << shift;
+		shift  += 1;
+	}
+
+	for (; h > 0; h >>= 1) {
+		*maskY += 0x01 << shift;
+		shift  += 1;
+	}
+}
+
+static CC_INLINE void UploadFullTexture(struct Bitmap* bmp, int rowWidth, 
+										cc_uint32* dst, int dst_w, int dst_h) {
+	int src_w = bmp->width, src_h = bmp->height;
+	unsigned maskX, maskY;
+	unsigned X = 0, Y = 0;
+	TwiddleCalcFactors(dst_w, dst_h, &maskX, &maskY);
+	
+	for (int y = 0; y < src_h; y++)
+	{
+		cc_uint32* src = bmp->scan0 + y * rowWidth;
+		X = 0;
+		
+		for (int x = 0; x < src_w; x++, src++)
+		{
+			dst[X | Y] = *src;
+			X = (X - maskX) & maskX;
+		}
+		Y = (Y - maskY) & maskY;
+	}
+}
+
+static CC_INLINE void UploadPalettedTexture(struct Bitmap* bmp, int rowWidth, BitmapCol* palette, int pal_count,
+											cc_uint8* dst, int dst_w, int dst_h) {
+	int src_w = bmp->width, src_h = bmp->height;
+	unsigned maskX, maskY;
+	unsigned X = 0, Y = 0;
+	TwiddleCalcFactors_Paletted(dst_w >> 1, dst_h, &maskX, &maskY);
+	
+	for (int y = 0; y < src_h; y++)
+	{
+		cc_uint32* src = bmp->scan0 + y * rowWidth;
+		X = 0;
+		
+		for (int x = 0; x < src_w; x += 2, src += 2)
+		{
+			int pal0 = FindInPalette(palette, pal_count, src[0]);
+			int pal1 = FindInPalette(palette, pal_count, src[1]);
+			dst[X | Y] = pal0 | (pal1 << 4);
+
+			X = (X - maskX) & maskX;
+		}
+		Y = (Y - maskY) & maskY;
+	}
+}
+
+static CC_INLINE void UploadPartialTexture(struct Bitmap* part, int rowWidth, cc_uint32* dst, int dst_w, int dst_h,
+						int originX, int originY) {
+	int src_w = part->width, src_h = part->height;
+	unsigned maskX, maskY;
+	unsigned X = 0, Y = 0;
+	TwiddleCalcFactors(dst_w, dst_h, &maskX, &maskY);
+
+	// Calculate start twiddled X and Y values
+	for (int x = 0; x < originX; x++) { X = (X - maskX) & maskX; }
+	for (int y = 0; y < originY; y++) { Y = (Y - maskY) & maskY; }
+	unsigned startX = X;
+	
+	for (int y = 0; y < src_h; y++)
+	{
+		cc_uint32* src = part->scan0 + y * rowWidth;
+		X = startX;
+		
+		for (int x = 0; x < src_w; x++, src++)
+		{
+			dst[X | Y] = *src;
+			X = (X - maskX) & maskX;
+		}
+		Y = (Y - maskY) & maskY;
+	}
+}
+
+
+/*########################################################################################################################*
+*---------------------------------------------------------Textures--------------------------------------------------------*
+*#########################################################################################################################*/
+typedef struct CCTexture_ {
+	cc_uint32 width, height;
+	cc_uint16 base, blocks; // VRAM block usage
+	cc_uint32 paletted;
+	BitmapCol palette[MAX_PAL_4BPP_ENTRIES]; // NOTE: palette must be aligned to 16 bytes
+	BitmapCol pixels[];    // NOTE: pixels must be aligned to 16 bytes
+} CCTexture;
+
+static_assert(sizeof(struct CCTexture_) % 16 == 0, "Texture struct size must be 16 byte aligned");
+
+static CC_INLINE void* Texture_PixelsAddr(CCTexture* tex) {
+	if (!tex->blocks) return tex->pixels;
+
+	char* texmem_start = (char*)sceGeEdramGetAddr() + ALL_BUFFERS_SIZE;
+	return texmem_start + (tex->base * TEXMEM_BLOCK_SIZE);
+}
+
+static CC_INLINE int Texture_PixelsSize(int w, int h, int paletted) {
+	return paletted ? (w * h / 2) : (w * h * BITMAPCOLOR_SIZE);
+}
+
+GfxResourceID Gfx_AllocTexture(struct Bitmap* bmp, int rowWidth, cc_uint8 flags, cc_bool mipmaps) {
+	int dst_w = Math_NextPowOf2(bmp->width);
+	int dst_h = Math_NextPowOf2(bmp->height);
+
+	BitmapCol palette[MAX_PAL_4BPP_ENTRIES];
+	int pal_count = 0;
+
+	if (!(flags & TEXTURE_FLAG_DYNAMIC)) {
+		pal_count = CalcPalette(palette, bmp, rowWidth);
+	}
+
+	int size   = Texture_PixelsSize(dst_w, dst_h, pal_count > 0);
+	int blocks = SIZE_TO_BLOCKS(size, TEXMEM_BLOCK_SIZE);
+	int base   = blockalloc_alloc(tex_table, TEXMEM_MAX_BLOCKS, blocks);
+	CCTexture* tex;
+
+	// Check if no room in VRAM
+	if (base == -1) {
+		// Swizzled texture assumes at least 16 bytes x 8 rows
+		size = CC_ALIGNUP(size, 16 * 8);
+		tex  = (CCTexture*)memalign(16, sizeof(CCTexture) + size);
+
+		blocks = 0;
+		if (!tex) return 0;
+	} else {
+		tex = (CCTexture*)Mem_TryAlloc(1, sizeof(CCTexture));
+		if (!tex) { 
+			blockalloc_dealloc(tex_table, base, blocks);
+			return 0;
+		}
+	}
+	
+	tex->width  = dst_w;
+	tex->height = dst_h;
+	tex->base   = base;
+	tex->blocks = blocks;
+	tex->paletted = pal_count > 0;
+
+	void* addr = Texture_PixelsAddr(tex);
+	if (pal_count > 0) {
+		Mem_Copy(tex->palette, palette, sizeof(palette));
+		UploadPalettedTexture(bmp, rowWidth, palette, pal_count, addr, dst_w, dst_h);
+		CPU_FlushDataCache(tex->palette, sizeof(palette));
+	} else {
+		UploadFullTexture(bmp, rowWidth, addr, dst_w, dst_h);
+	}
+
+	CPU_FlushDataCache(addr, size);
+	return tex;
+}
+
+void Gfx_UpdateTexture(GfxResourceID texId, int x, int y, struct Bitmap* part, int rowWidth, cc_bool mipmaps) {
+	CCTexture* tex = (CCTexture*)texId;
+	void* addr = Texture_PixelsAddr(tex);
+
+	UploadPartialTexture(part, rowWidth, addr, tex->width, tex->height, x, y);
+
+	// TODO: Do line by line and only invalidate the actually changed parts of lines? harder with swizzling
+	// TODO: Invalidate full tex->size in case of very small textures?
+	int size = Texture_PixelsSize(tex->width, tex->height, false);
+	CPU_FlushDataCache(addr, size);
+}
+
+void Gfx_DeleteTexture(GfxResourceID* texId) {
+	CCTexture* tex = (CCTexture*)(*texId);
+	if (tex) {
+    	blockalloc_dealloc(tex_table, tex->base, tex->blocks);
+		Mem_Free(tex);
+	}
+
+	*texId = NULL;
+}
+
+void Gfx_EnableMipmaps(void) { }
+void Gfx_DisableMipmaps(void) { }
+
+void Gfx_BindTexture(GfxResourceID texId) {
+	CCTexture* tex = (CCTexture*)texId;
+	if (!tex) tex  = white_square; 
+	
+	if (tex->paletted) {
+		GE_set_clut_buffer(tex->palette);
+		GE_load_clut_entries(MAX_PAL_4BPP_ENTRIES);
+		sceGuTexMode(GU_PSM_T4, 0, 0, 1);
+	} else {
+		sceGuTexMode(GU_PSM_8888, 0, 0, 1);
+	}
+
+	void* addr = Texture_PixelsAddr(tex);
+	sceGuTexImage(0, tex->width, tex->height, tex->width, addr);
+}
+
+
+/*########################################################################################################################*
+*-----------------------------------------------------State management----------------------------------------------------*
+*#########################################################################################################################*/
+static PackedCol gfx_clearColor;
+void Gfx_SetAlphaArgBlend(cc_bool enabled) { }
+
+void Gfx_SetFaceCulling(cc_bool enabled) {
+	GE_set_face_culling(enabled);
+}
+
+static void SetAlphaBlend(cc_bool enabled) { 
+	GE_set_alpha_blending(enabled); 
+}
+
+void Gfx_ClearColor(PackedCol color) {
+	if (color == gfx_clearColor) return;
+	gfx_clearColor = color;
+}
+
+static void SetColorWrite(cc_bool r, cc_bool g, cc_bool b, cc_bool a) {
+	unsigned int mask = 0xffffffff;
+	if (r) mask &= 0xffffff00;
+	if (g) mask &= 0xffff00ff;
+	if (b) mask &= 0xff00ffff;
+	if (a) mask &= 0x00ffffff;
+	
+	sceGuPixelMask(mask);
+}
+
+void Gfx_SetDepthWrite(cc_bool enabled) {
+	sceGuDepthMask(enabled ? 0 : 0xffffffff);
+}
+
+void Gfx_SetDepthTest(cc_bool enabled) { 
+	GE_set_depth_testing(enabled); 
+}
+
+/*########################################################################################################################*
+*---------------------------------------------------------Matrices--------------------------------------------------------*
+*#########################################################################################################################*/
+void Gfx_CalcOrthoMatrix(struct Matrix* matrix, float width, float height, float zNear, float zFar) {
+	// Transposed, source https://learn.microsoft.com/en-us/windows/win32/opengl/glortho
+	//   The simplified calculation below uses: L = 0, R = width, T = 0, B = height
+	// NOTE: Shared with OpenGL. might be wrong to do that though?
+	*matrix = Matrix_Identity;
+
+	matrix->row1.x =  2.0f / width;
+	matrix->row2.y = -2.0f / height;
+	matrix->row3.z = -2.0f / (zFar - zNear);
+
+	matrix->row4.x = -1.0f;
+	matrix->row4.y =  1.0f;
+	matrix->row4.z = -(zFar + zNear) / (zFar - zNear);
+}
+
+static float Cotangent(float x) { return Math_CosF(x) / Math_SinF(x); }
+void Gfx_CalcPerspectiveMatrix(struct Matrix* matrix, float fov, float aspect, float zFar) {
+	float zNear = 0.1f;
+	float c = Cotangent(0.5f * fov);
+
+	// Transposed, source https://learn.microsoft.com/en-us/windows/win32/opengl/glfrustum
+	// For a FOV based perspective matrix, left/right/top/bottom are calculated as:
+	//   left = -c * aspect, right = c * aspect, bottom = -c, top = c
+	// Calculations are simplified because of left/right and top/bottom symmetry
+	*matrix = Matrix_Identity;
+
+	matrix->row1.x =  c / aspect;
+	matrix->row2.y =  c;
+	matrix->row3.z = -(zFar + zNear) / (zFar - zNear);
+	matrix->row3.w = -1.0f;
+	matrix->row4.z = -(2.0f * zFar * zNear) / (zFar - zNear);
+	matrix->row4.w =  0.0f;
+	// TODO: should direct3d9 one be used insted with clip range from 0,1 ?
+}
+
+
+/*########################################################################################################################*
+*-----------------------------------------------------------Misc----------------------------------------------------------*
+*#########################################################################################################################*/
+static BitmapCol* PSP_GetRow(struct Bitmap* bmp, int y, void* ctx) {
+	cc_uint8* fb = (cc_uint8*)ctx;
+	return (BitmapCol*)(fb + y * BUFFER_WIDTH * 4);
+}
+
+cc_result Gfx_TakeScreenshot(struct Stream* output) {
+	int fbWidth, fbFormat;
+	void* fb;
+
+	int res = sceDisplayGetFrameBuf(&fb, &fbWidth, &fbFormat, PSP_DISPLAY_SETBUF_NEXTFRAME);
+	if (res < 0) return res;
+	if (!fb)     return ERR_NOT_SUPPORTED;
+
+	struct Bitmap bmp;
+	bmp.scan0  = NULL;
+	bmp.width  = SCREEN_WIDTH; 
+	bmp.height = SCREEN_HEIGHT;
+
+	return Png_Encode(&bmp, output, PSP_GetRow, false, fb);
+}
+
+void Gfx_GetApiInfo(cc_string* info) {
+	int freeMem, usedMem;
+	blockalloc_calc_usage(tex_table, TEXMEM_MAX_BLOCKS, TEXMEM_BLOCK_SIZE, 
+							&freeMem, &usedMem);
+	
+	float freeMemMB = freeMem / (1024.0f * 1024.0f);
+	float usedMemMB = usedMem / (1024.0f * 1024.0f);
+
+	String_AppendConst(info, "-- Using PSP--\n");
+	PrintMaxTextureInfo(info);
+	String_Format2(info,     "Texture memory: %f2 MB used, %f2 MB free\n", &usedMemMB, &freeMemMB);
+}
+
+void Gfx_SetVSync(cc_bool vsync) {
+	gfx_vsync = vsync;
+}
+
+void Gfx_BeginFrame(void) {
+	sceGuStart(GU_DIRECT, list); 
+	// TODO should be called in EndFrame, GPU commands outside EndFrame/BegFrame are missed otherwise
+	last_base = -1;
+}
+
+void Gfx_EndFrame(void) {
+	sceGuFinish();
+	sceGeDrawSync(GU_SYNC_WAIT); // waits until FINISH command is reached
+
+	if (gfx_vsync) sceDisplayWaitVblankStart();
+	sceGuSwapBuffers();
+
+	//Platform_Log3("C %i/%i / U %i", &CLIPPED, &MACLIPPED, &UNCLIPPED);
+	CLIPPED = MACLIPPED = UNCLIPPED = 0;
+}
+
+void Gfx_OnWindowResize(int width, int height) {
+	Gfx_SetViewport(0, 0, width, height);
+	Gfx_SetScissor( 0, 0, width, height);
+}
+
+void Gfx_SetViewport(int x, int y, int w, int h) {
+	// PSP X/Y guard band ranges from 0..GB_RANGE
+	// To minimise need to clip, centre the viewport around (GB_RANGE/2, GB_RANGE/2)
+	GE_set_viewport_x(GB_HALF + x,  w / 2);
+	GE_set_viewport_y(GB_HALF + y, -h / 2);
+
+	// Afterwards, subtract the viewport centre so coordinates end up in 0..SCR_WIDTH/HEIGHT
+	GE_set_screen_offset(GB_HALF - (w / 2), GB_HALF - (h / 2));
+	// So e.g. for X coordinates:
+	// - [-1, 1] (visible coordinate range)
+	// - [-1, 1] * w/2 + (GB_HALF + x) (viewport transform)
+	// - [-1, 1] * w/2 + (GB_HALF + x) - (GB_HALF - w/2) (viewport transform then screen offset)
+	// - [-1, 1] * w/2 + GB_HALF + x - GB_HALF + w/2 (simplification #1)
+	// - [-1, 1] * w/2 + x + w/2 (simplification #2)
+	// - [-w/2, w/2] + x + w/2 (simplification #3)
+	// - [-w/2+x+w/2, w/2+x+w/2] (simplification #4)
+	// - [x, x+w] (simplification #5)
+}
+
+void Gfx_SetScissor(int x, int y, int w, int h) {
+	GE_set_scissor_region(x, y, x+w-1, y+h-1);
+}
+
+
+/*########################################################################################################################*
+*---------------------------------------------------------Clearing--------------------------------------------------------*
+*#########################################################################################################################*/
+// See https://www.ppsspp.org/docs/psp-hardware/gpu/ge-overview/
+// "Memory performance has a few quirks. For example, it's profitable to draw 2D images in 64- or 32- pixel wide vertical strips, 
+//  depending on color depth and texture format. This is why screen clears are usually performed as a series of vertical strips."
+#define CLEAR_DEPTH 65535
+#define STRIP_WIDTH    32
+
+typedef struct ClearVertex
+{
+	cc_uint32 color;
+	cc_uint16 x, y, z;
+	cc_uint16 pad;
+} ClearVertex;
+
+void Gfx_ClearBuffers(GfxBuffers buffers) {
+	int targets = 0;
+	if (buffers & GFX_BUFFER_COLOR) targets |= GU_COLOR_BUFFER_BIT;
+	if (buffers & GFX_BUFFER_DEPTH) targets |= GU_DEPTH_BUFFER_BIT;
+	
+	PackedCol color = gfx_clearColor & 0xFFFFFF;
+	const int strips = (SCREEN_WIDTH + STRIP_WIDTH - 1) / STRIP_WIDTH;
+	const int count  = strips * 2;
+
+	ClearVertex* vertices = (ClearVertex*)GE_ReserveListSpace(count * sizeof(ClearVertex));
+	ClearVertex* v = vertices;
+
+	for (int i = 0; i < strips; i++)
+	{
+		v->color = color;
+		v->x = i * STRIP_WIDTH;
+		v->y = 0;
+		v->z = CLEAR_DEPTH;
+		v++;
+
+		v->color = color;
+		v->x = (i + 1) * STRIP_WIDTH;
+		v->y = SCREEN_HEIGHT;
+		v->z = CLEAR_DEPTH;
+		v++;
+	}
+
+	GE_set_clearing_state(true, targets);
+	{
+    	GE_set_vertex_format(GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D);
+    	GE_set_vertices(vertices);
+		GE_draw_array(GU_SPRITES, count);
+	}
+	GE_set_clearing_state(false, 0);
+	GE_set_vertex_format(gfx_fields | GU_INDEX_16BIT);
+}
+
+
+/*########################################################################################################################*
+*----------------------------------------------------------Buffers--------------------------------------------------------*
+*#########################################################################################################################*/
+static cc_uint16 CC_ALIGNED(16) gfx_indices[GFX_MAX_INDICES];
+static int vb_size;
+
+GfxResourceID Gfx_CreateIb2(int count, Gfx_FillIBFunc fillFunc, void* obj) {
+	fillFunc(gfx_indices, count, obj);
+	return gfx_indices;
+}
+
+void Gfx_BindIb(GfxResourceID ib) { 
+	// TODO doesn't work properly
+	//GE_set_index_buffer(ib);
+}
+void Gfx_DeleteIb(GfxResourceID* ib) { }
+
+
+static GfxResourceID Gfx_AllocStaticVb(VertexFormat fmt, int count) {
+	return memalign(16, count * strideSizes[fmt]);
+}
+
+void Gfx_BindVb(GfxResourceID vb) { gfx_vertices = vb; }
+
+void Gfx_DeleteVb(GfxResourceID* vb) {
+	GfxResourceID data = *vb;
+	if (data) Mem_Free(data);
+	*vb = 0;
+}
+
+void* Gfx_LockVb(GfxResourceID vb, VertexFormat fmt, int count) {
+	vb_size = count * strideSizes[fmt];
+	return vb;
+}
+
+void Gfx_UnlockVb(GfxResourceID vb) {
+	CPU_FlushDataCache(vb, vb_size);
+}
+
+
+/*########################################################################################################################*
+*-----------------------------------------------------State management----------------------------------------------------*
+*#########################################################################################################################*/
+static PackedCol gfx_fogColor;
+static float gfx_fogEnd = -1.0f, gfx_fogDensity = -1.0f;
+static int gfx_fogMode  = -1;
+
+void Gfx_SetFog(cc_bool enabled) {
+	gfx_fogEnabled = enabled;
+	GE_set_fog_active(enabled);
+}
+
+void Gfx_SetFogCol(PackedCol color) {
+	if (color == gfx_fogColor) return;
+
+	gfx_fogColor = color;
+	GE_set_fog_color(color);
+}
+
+static void UpdateFog(void) {
+	float depth;
+
+	if (gfx_fogMode == FOG_EXP) {
+		// See algorithm in EnvRenderer.c
+		#define LOG_005 -2.99573227355399f
+
+		depth = LOG_005 / -gfx_fogDensity;
+	} else {
+		depth = gfx_fogEnd;
+	}
+	GE_set_fog_range(depth);
+}
+
+void Gfx_SetFogDensity(float value) {
+	if (value == gfx_fogDensity) return;
+	gfx_fogDensity = value;
+	UpdateFog();
+}
+
+void Gfx_SetFogEnd(float value) {
+	if (value == gfx_fogEnd) return;
+	gfx_fogEnd = value;
+	UpdateFog();
+}
+
+void Gfx_SetFogMode(FogFunc func) {
+	if (func == gfx_fogMode) return;
+	gfx_fogMode = func;
+	UpdateFog();
+}
+
+static void SetAlphaTest(cc_bool enabled) { 
+	GE_set_alpha_testing(enabled);
+}
+
+void Gfx_DepthOnlyRendering(cc_bool depthOnly) {
+	cc_bool enabled = !depthOnly;
+	SetColorWrite(enabled & gfx_colorMask[0], enabled & gfx_colorMask[1], 
+				  enabled & gfx_colorMask[2], enabled & gfx_colorMask[3]);
+}
+
+
+/*########################################################################################################################*
+*---------------------------------------------------------Matrices--------------------------------------------------------*
+*#########################################################################################################################*/
+extern void Clip_LoadView(const float* src);
+extern void Clip_LoadProj(const float* src);
+extern void Clip_RecalcMVP(void);
+extern void Clip_StoreMVP(float* dst);
+extern void Clip_RescaleMVPtoGuardband(void);
+
+static cc_bool clipping_dirty;
+static struct Plane frustum_planes[6];
+
+extern void Frustum_CalcAllPlanes(void);
+extern void Frustum_StorePlanes(struct Plane* planes);
+extern void Frustum_SavePlanes(void);
+
+static CC_INLINE void RecalcMVP(void) {
+	Clip_RecalcMVP();
+	clipping_dirty = true;
+}
+
+static CC_NOINLINE void RecalcClipping(void) {
+	Frustum_CalcAllPlanes();
+	Frustum_StorePlanes(frustum_planes);
+	clipping_dirty = false;
+	Clip_RescaleMVPtoGuardband();
+}
+
+static void LoadMatrix(MatrixType type, const struct Matrix* matrix) {
+	const float* m = (const float*)matrix;
+
+	if (type == MATRIX_PROJ) {
+		GE_upload_proj_matrix(m);
+		Clip_LoadProj(m);
+	} else {
+		GE_upload_view_matrix(m);
+		Clip_LoadView(m);
+	}
+}
+
+void Gfx_LoadMatrix(MatrixType type, const struct Matrix* matrix) {
+	LoadMatrix(type, matrix);
+	Clip_RecalcMVP();
+	clipping_dirty = true;
+}
+
+void Gfx_LoadMVP(const struct Matrix* view, const struct Matrix* proj, struct Matrix* mvp) {
+	LoadMatrix(MATRIX_VIEW, view);
+	LoadMatrix(MATRIX_PROJ, proj);
+
+	Clip_RecalcMVP();
+	Clip_StoreMVP((float*)mvp);
+	RecalcClipping();
+
+	Frustum_CalcAllPlanes();
+	Frustum_SavePlanes();
+}
+
+void Gfx_EnableTextureOffset(float x, float y) {
+	GE_set_texture_offset(x, y);
+}
+
+void Gfx_DisableTextureOffset(void) { 
+	GE_set_texture_offset(0.0f, 0.0f);
+}
+
+
+/*########################################################################################################################*
+*---------------------------------------------------------Drawing---------------------------------------------------------*
+*#########################################################################################################################*/
+cc_bool Gfx_WarnIfNecessary(void) { return false; }
+cc_bool Gfx_GetUIOptions(struct MenuOptionsScreen* s) { return false; }
+
+void Gfx_SetVertexFormat(VertexFormat fmt) {
+	if (fmt == gfx_format) return;
+	gfx_format = fmt;
+	gfx_fields = formatFields[fmt];
+	gfx_stride = strideSizes[fmt];
+
+	GE_set_texturing(fmt == VERTEX_FORMAT_TEXTURED);
+	GE_set_vertex_format(gfx_fields | GU_INDEX_16BIT);
+}
+
+void Gfx_DrawVb_Lines(int verticesCount) {
+	// More efficient to set "indexed 16 bit" as default in Gfx_SetVertexFormat,
+	//  rather than in every single triangle draw command
+	GE_set_vertex_format(gfx_fields);
+	GE_set_vertices(gfx_vertices);
+
+	GE_draw_array(GU_LINES, verticesCount);
+	GE_set_vertex_format(gfx_fields | GU_INDEX_16BIT);
+}
+
+struct ClipVertex {
+	float x, y, z, w;
+	float u, v;
+	int c, flags;
+} CC_ALIGNED(16);
+
+extern int QuadNeedsClipping(float* xyz_first, int stride);
+extern cc_uintptr Clip_PolyToPlanes(struct ClipVertex* buf1, struct ClipVertex* buf2, 
+											int planes_count, struct Plane* plane);
+#define CLIPRESULT_COUNT(res)   (int)((res) & 0x0F);
+#define CLIPRESULT_BUFFER(res)  (struct ClipVertex*)((res) & ~0x0F);
+
+static CC_INLINE void SubmitClippedVertices(const void* ptr, int count) {
+	GE_set_vertex_format(gfx_fields);
+	GE_set_vertices(ptr);
+	GE_draw_array(GU_TRIANGLE_FAN, count);
+	GE_set_vertex_format(gfx_fields | GU_INDEX_16BIT);
+	CLIPPED++;
+}
+
+extern void ConvertTexturedToClipQuad(struct VertexTextured* V, struct ClipVertex* C);
+extern void ConvertColouredToClipQuad(struct VertexColoured* V, struct ClipVertex* C);
+
+static void* EnqueueTexturedVertices(struct ClipVertex* buf, int count) {
+	void* ptr = GE_ReserveListSpace(sizeof(struct VertexTextured) * count);
+	struct VertexTextured* a = ptr;
+
+	for (int i = 0; i < count; i++)
+	{
+		a[i].x = buf[i].x;
+		a[i].y = buf[i].y;
+		a[i].z = buf[i].z;
+		a[i].U = buf[i].u;
+		a[i].V = buf[i].v;
+		a[i].Col = buf[i].c;
+	}
+	return ptr;
+}
+
+static void* EnqueueColouredVertices(struct ClipVertex* buf, int count) {
+	void* ptr = GE_ReserveListSpace(sizeof(struct VertexColoured) * count);
+	struct VertexColoured* a = ptr;
+
+	for (int i = 0; i < count; i++)
+	{
+		a[i].x = buf[i].x;
+		a[i].y = buf[i].y;
+		a[i].z = buf[i].z;
+		a[i].Col = buf[i].c;
+	}
+	return ptr;
+}
+
+// TODO don't set vertex format is unchanged
+#define CLIPPABLE_FLUSH_RUN() \
+	if (run) { \
+		GE_set_vertices(beg); \
+		GE_set_indices(gfx_indices); \
+		GE_draw_array(GU_TRIANGLES, run); \
+	} \
+	run = 0; beg = v + 4;
+
+static void DrawClippableTexturedVertices(struct VertexTextured* v, int verticesCount) {
+	struct VertexTextured* beg = v;
+	int run = 0;
+	if (clipping_dirty) RecalcClipping();
+
+	// clipping variables
+	struct ClipVertex clipped1[16], clipped2[16];
+	struct ClipVertex* buf;
+	cc_uintptr res;
+	void* ptr;
+	int cnt;
+	
+	for (int i = 0; i < verticesCount; i += 4, v += 4)
+	{
+		if (QuadNeedsClipping(&v->x, SIZEOF_VERTEX_TEXTURED)) {
+			MACLIPPED++;
+			ConvertTexturedToClipQuad(v, clipped1);
+			res = Clip_PolyToPlanes(clipped2, clipped1, 4, frustum_planes);
+			if (res == 0) { run += 6; continue; }
+
+			cnt = CLIPRESULT_COUNT(res);
+			buf = CLIPRESULT_BUFFER(res);
+			ptr = EnqueueTexturedVertices(buf, cnt);
+
+			CLIPPABLE_FLUSH_RUN();
+			SubmitClippedVertices(ptr, cnt);
+		} else {
+			run += 6; UNCLIPPED++;
+		}
+	}
+	CLIPPABLE_FLUSH_RUN();
+}
+
+static void DrawClippableColouredVertices(struct VertexColoured* v, int verticesCount) {
+	struct VertexColoured* beg = v;
+	int run = 0;
+	if (clipping_dirty) RecalcClipping();
+
+	// clipping variables
+	struct ClipVertex clipped1[16], clipped2[16];
+	struct ClipVertex* buf;
+	cc_uintptr res;
+	void* ptr;
+	int cnt;
+	
+	for (int i = 0; i < verticesCount; i += 4, v += 4)
+	{
+		if (QuadNeedsClipping(&v->x, SIZEOF_VERTEX_COLOURED)) {
+			MACLIPPED++;
+			ConvertColouredToClipQuad(v, clipped1);
+			res = Clip_PolyToPlanes(clipped2, clipped1, 4, frustum_planes);
+			if (res == 0) { run += 6; continue; }
+
+			cnt = CLIPRESULT_COUNT(res);
+			buf = CLIPRESULT_BUFFER(res);
+			ptr = EnqueueColouredVertices(buf, cnt);
+
+			CLIPPABLE_FLUSH_RUN();
+			SubmitClippedVertices(ptr, cnt);
+		} else {
+			run += 6; UNCLIPPED++;
+		}
+	}
+	CLIPPABLE_FLUSH_RUN();
+}
+
+static void DrawTriangles(void* vertices, int verticesCount, DrawHints hints) {
+	if (gfx_rendering2D || (hints & DRAW_HINT_NOCLIP)) {
+		GE_set_vertices(vertices);
+		GE_set_indices(gfx_indices);
+
+		GE_draw_array(GU_TRIANGLES, ICOUNT(verticesCount));
+	} else if (gfx_format == VERTEX_FORMAT_TEXTURED) {
+		DrawClippableTexturedVertices(vertices, verticesCount);
+	} else {
+		DrawClippableColouredVertices(vertices, verticesCount);
+	}
+}
+
+void Gfx_DrawVb_IndexedTris_Range(int verticesCount, int startVertex, DrawHints hints) {
+	DrawTriangles(gfx_vertices + startVertex * gfx_stride, verticesCount, hints);
+}
+
+void Gfx_DrawVb_IndexedTris(int verticesCount) {
+	DrawTriangles(gfx_vertices, verticesCount, DRAW_HINT_NONE);
+}
+
+void Gfx_DrawIndexedTris_T2fC4b(int verticesCount, int startVertex, DrawHints hints) {
+	DrawTriangles(gfx_vertices + startVertex * SIZEOF_VERTEX_TEXTURED, verticesCount, hints);
+}
+

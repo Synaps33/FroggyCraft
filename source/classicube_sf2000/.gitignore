@@ -1,0 +1,10 @@
+build/
+frames/
+*.o
+*.d
+*.so
+*.a
+test_runner
+core_87000000_SF2000
+core_87000000_GB300V2
+options.txt

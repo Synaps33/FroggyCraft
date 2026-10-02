@@ -1,0 +1,67 @@
+name: Build latest (NetBSD)
+# trigger via either push to selected branches or on manual run
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}-netbsd
+  cancel-in-progress: true
+
+jobs:
+  build:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/cross-rs/x86_64-unknown-netbsd:edge
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get -y install zip wget
+
+      - name: Retrieve OpenGL and X11 dev files (64 bit)
+        run: |
+          wget https://github.com/ClassiCube/rpi-compiling-stuff/raw/main/netbsd64.zip
+          unzip netbsd64.zip -d netbsd64
+
+      - name: Compile NetBSD 64 bit build
+        shell: bash
+        run: |
+          LATEST_FLAG=-DCC_COMMIT_SHA=\\\"${GITHUB_SHA::9}\\\"
+
+          COMMON_CFLAGS="-fno-stack-protector -fno-pie -fcf-protection=none $LATEST_FLAG"
+          COMMON_LDFLAGS="-s -L netbsd64/lib -Wl,-R/usr/X11R7/lib -Wl,--unresolved-symbols=ignore-in-shared-libs"
+
+          make netbsd dist RELEASE=1 TARGET=cc-netbsd64-gl1 CC=x86_64-unknown-netbsd-gcc \
+                EXTRA_CFLAGS="$COMMON_CFLAGS" \
+                EXTRA_LDFLAGS="$COMMON_LDFLAGS"
+          
+          
+      - uses: ./.github/actions/upload_build
+        with:
+          SOURCE_FILE: 'cc-netbsd64-gl1'
+          DEST_NAME: 'ClassiCube-NetBSD-64'
+
+
+      - uses: ./.github/actions/upload_build
+        with:
+          SOURCE_FILE: 'cc-netbsd64-gl1.tar.gz'
+          DEST_NAME: 'ClassiCube-netbsd64.tar.gz'
+          
+          
+      - uses: ./.github/actions/notify_success
+        with:
+          DESTINATION_URL: '${{ secrets.NOTIFY_URL }}'
+          WORKFLOW_NAME: 'netbsd'
+
+
+      - uses: ./.github/actions/notify_failure
+        if: failure()
+        with:
+          NOTIFY_MESSAGE: 'Failed to produce NetBSD build(s)'
+          WEBHOOK_URL: '${{ secrets.WEBHOOK_URL }}'

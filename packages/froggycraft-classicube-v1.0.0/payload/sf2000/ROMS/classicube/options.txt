@@ -1,0 +1,16 @@
+# ClassiCube options - tuned for SF2000 / GB300
+# 320x240 panel, software fixed-point rasterizer, no FPU, no networking.
+
+# Short view distance: fewer chunks => much less software rasterization.
+# NOTE: ClassiCube rewrites this file on exit, so whatever you last set in the
+# in-game options menu wins from then on.
+viewdist=16
+fpslimit=Limit30FPS
+
+# Small view distance: the software rasterizer has no FPU on this CPU, so
+# fewer loaded chunks is the single biggest win for input responsiveness.
+
+# "fast" = no sky, no clouds (they are large full-screen fills)
+normal=fast
+
+username=Player

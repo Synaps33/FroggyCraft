@@ -1,0 +1,838 @@
+diff --git a/.github/scripts/entrypoint.sh b/.github/scripts/entrypoint.sh
+index 7afa11e..b34af17 100755
+--- a/.github/scripts/entrypoint.sh
++++ b/.github/scripts/entrypoint.sh
+@@ -27,6 +27,7 @@ mkdir -p /__w/gb300_multicore/gb300_multicore/sdcard/roms/2048
+ mkdir -p /__w/gb300_multicore/gb300_multicore/sdcard/roms/gong
+ mkdir -p /__w/gb300_multicore/gb300_multicore/sdcard/roms/outrun
+ mkdir -p /__w/gb300_multicore/gb300_multicore/sdcard/roms/wolf3d
++mkdir -p /__w/gb300_multicore/gb300_multicore/sdcard/roms/fheroes2
+ mkdir -p /__w/gb300_multicore/gb300_multicore/sdcard/roms/prboom
+ mkdir -p /__w/gb300_multicore/gb300_multicore/sdcard/roms/flashback
+ mkdir -p /__w/gb300_multicore/gb300_multicore/sdcard/roms/xrick
+diff --git a/.github/scripts/local_entrypoint.sh b/.github/scripts/local_entrypoint.sh
+index 7cc362b..e2fe1fe 100644
+--- a/.github/scripts/local_entrypoint.sh
++++ b/.github/scripts/local_entrypoint.sh
+@@ -29,6 +29,7 @@ mkdir -p sdcard/roms/2048
+ mkdir -p sdcard/roms/gong
+ mkdir -p sdcard/roms/outrun
+ mkdir -p sdcard/roms/wolf3d
++mkdir -p sdcard/roms/fheroes2
+ mkdir -p sdcard/roms/prboom
+ mkdir -p sdcard/roms/flashback
+ mkdir -p sdcard/roms/xrick
+diff --git a/.gitignore b/.gitignore
+index b47cb4a..5d4f6ef 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,3 +11,7 @@ bisrv.asd
+ core_87000000
+ crc
+ *~*
++
++# Root symlinks for core backwards compatibility
++/*.h
++/dist/
+diff --git a/Makefile b/Makefile
+index 25e7359..da0b856 100644
+--- a/Makefile
++++ b/Makefile
+@@ -29,7 +29,7 @@ CXX = $(MIPS)g++
+ LD = $(MIPS)ld
+ OBJCOPY = $(MIPS)objcopy
+ 
+-CFLAGS := -EL -march=mips32 -mtune=mips32 -msoft-float
++CFLAGS := -EL -march=mips32 -mtune=mips32r2 -msoft-float
+ CFLAGS += -I $(INC_DIR) -I libs/libretro-common/include -I libs/Argent-Cores/include
+ CFLAGS += -Os -G0 -mno-abicalls -fno-pic
+ CFLAGS += -ffunction-sections -fdata-sections
+@@ -76,9 +76,12 @@ LDFLAGS += --gc-sections
+ # needed for .text LMA = VMA
+ LDFLAGS += --build-id
+ 
+-CXX_LDFLAGS := -EL -march=mips32 -mtune=mips32 -msoft-float
+-CXX_LDFLAGS += -Wl,--gc-sections --static
++CXX_LDFLAGS := -EL -march=mips32 -mtune=mips32r2 -msoft-float
++CXX_LDFLAGS += -Wl,--gc-sections --static -flto
+ CXX_LDFLAGS += -z max-page-size=32
++# Route free() calls through __wrap_free in libretro_frontend/lib.c, which can
++# report invalid pointers together with the caller address (heap debugging).
++CXX_LDFLAGS += -Wl,--wrap=free
+ 
+ CORE_OBJS = $(patsubst $(SRC_DIR)/libretro_frontend/%.c, $(BUILD_DIR)/%.o, $(wildcard $(SRC_DIR)/libretro_frontend/*.c))
+ CORE_OBJS += $(BUILD_DIR)/debug.o
+@@ -86,9 +89,11 @@ LOADER_OBJS = $(BUILD_DIR)/init.o $(BUILD_DIR)/main.o $(BUILD_DIR)/debug.o
+ 
+ # Default target
+ ifneq ($(CORE),)
+-all: $(BUILD_DIR)/core_87000000 $(BUILD_DIR)/bisrv.asd install
++install: $(BUILD_DIR)/core_87000000 $(BUILD_DIR)/bisrv.asd
++all: install
+ else
+-all: $(BUILD_DIR)/bisrv.asd install
++install: $(BUILD_DIR)/bisrv.asd
++all: install
+ endif
+ 
+ $(BUILD_DIR):
+diff --git a/assets/scripts/buildcores.sh b/assets/scripts/buildcores.sh
+index b2e6234..f538527 100644
+--- a/assets/scripts/buildcores.sh
++++ b/assets/scripts/buildcores.sh
+@@ -16,6 +16,7 @@ make CONSOLE=retro8     CORE=cores/retro8 && \
+ make CONSOLE=vapor      CORE=cores/vaporspec/machine MAKEFILE=-fMakefile.libretro && \
+ #make CONSOLE=2048       CORE=cores/libretro-2048 MAKEFILE=-fMakefile.libretro && \
+ make CONSOLE=gong       CORE=cores/gong MAKEFILE=-fMakefile.libretro && \
++make CONSOLE=fheroes2   CORE=cores/fheroes2 && \
+ make CONSOLE=outrun     CORE=cores/cannonball && \
+ make CONSOLE=wolf3d     CORE=cores/ecwolf/src/libretro && \
+ make CONSOLE=prboom     CORE=cores/libretro-prboom && \
+diff --git a/assets/scripts/cleancores.sh b/assets/scripts/cleancores.sh
+index ea10ebd..857127a 100644
+--- a/assets/scripts/cleancores.sh
++++ b/assets/scripts/cleancores.sh
+@@ -16,6 +16,7 @@ make clean CONSOLE=retro8     CORE=cores/retro8 && \
+ make clean CONSOLE=vapor      CORE=cores/vaporspec/machine MAKEFILE=-fMakefile.libretro && \
+ make clean CONSOLE=2048       CORE=cores/libretro-2048 MAKEFILE=-fMakefile.libretro && \
+ make clean CONSOLE=gong       CORE=cores/gong MAKEFILE=-fMakefile.libretro && \
++make clean CONSOLE=fheroes2   CORE=cores/fheroes2 && \
+ make clean CONSOLE=outrun     CORE=cores/cannonball && \
+ make clean CONSOLE=wolf3d     CORE=cores/ecwolf/src/libretro && \
+ make clean CONSOLE=prboom     CORE=cores/libretro-prboom && \
+diff --git a/libs/libretro-common b/libs/libretro-common
+--- a/libs/libretro-common
++++ b/libs/libretro-common
+@@ -1 +1 @@
+-Subproject commit 9362316bf1da38160b324a1515bfb83e44ebd7af
++Subproject commit 9362316bf1da38160b324a1515bfb83e44ebd7af-dirty
+diff --git a/src/debug.c b/src/debug.c
+index 2360734..5eb0c16 100644
+--- a/src/debug.c
++++ b/src/debug.c
+@@ -199,26 +199,24 @@ static bool is_file_exists(const char *path)
+ 
+ static bool is_xlog_enabled()
+ {
+-	static bool enabled;
+-	static bool first_call = true;
+-
+-	if (first_call)
+-	{
+-		first_call = false;
+-
+-		// only allow logging if log file already exists
+-		enabled = is_file_exists(LOG_FILENAME);
++	static int enabled = -1;
++	if (enabled < 0) {
++		/* Only enable logging if explicitly requested via flag file */
++		enabled = (fs_access("/mnt/sda1/bios/enable_xlog.txt", 0) == 0) ? 1 : 0;
+ 	}
+-
+-	return enabled;
++	return enabled == 1;
+ }
+ 
++static int g_xlog_count = 0;
++
+ void xlog_clear()
+ {
+ 	if (!is_xlog_enabled())
+ 		return;
+ 
+ 	// we don't have a fs delete function, so instead just truncate the log file
++	g_xlog_count = 0;
++
+ 	FILE *hlog = fopen(LOG_FILENAME, "w");
+ 	if (!hlog)
+ 		return;
+@@ -227,26 +225,29 @@ void xlog_clear()
+ 	fs_sync(LOG_FILENAME);
+ }
+ 
++/* Log throttling.
++ *
++ * xlog() used to do fopen()+fwrite()+fclose()+fs_sync() for every line. On
++ * GB300 that is slow enough to look like a hang, and it produced hundreds of
++ * kB per session. The handle is still opened per call (each core needs its own
++ * copy), but fs_sync runs only every 64th line, which keeps the log safe to
++ * read after a crash while cutting the flash writes by 64x.
++ *
++ * Only one static int is used: the multicore loader has a hard .bss budget
++ * (linker_scripts/bisrv_GB300_V2.ld) and a file handle does not fit. */
+ void xlog(const char *fmt, ...)
+ {
++	char buffer[999];
++	va_list args;
++	FILE *hlog;
++
+ 	if (!is_xlog_enabled())
+ 		return;
+ 
+-	// TODO: currently simply open and close the log file after each print.
+-	// yes it might be slow, but it also allows both the loader and the dynamically
+-	// loaded cores to have and use their own copy of xlog without conflicts.
+-	// 
+-	// should consider changing hlog to be static and only open the log file once.
+-	// but in that case the cores should not have their own xlog, but rather the loader
+-	// would pass its xlog to the cores, so that there would be only one open hlog handle.
+-
+-	FILE* hlog = fopen(LOG_FILENAME, "a");
++	hlog = fopen(LOG_FILENAME, "a");
+ 	if (!hlog)
+ 		return;
+ 
+-	char buffer[999];
+-
+-	va_list args;
+ 	va_start(args, fmt);
+ 	vsnprintf(buffer, sizeof(buffer), fmt, args);
+ 	va_end(args);
+@@ -254,5 +255,7 @@ void xlog(const char *fmt, ...)
+ 	fwrite(buffer, strlen(buffer), 1, hlog);
+ 	fclose(hlog);
+ 
+-	fs_sync(LOG_FILENAME);
++	g_xlog_count++;
++	if ((g_xlog_count & 63) == 0)
++		fs_sync(LOG_FILENAME);
+ }
+diff --git a/src/libretro_frontend/core_api.c b/src/libretro_frontend/core_api.c
+index 579a17e..4521840 100644
+--- a/src/libretro_frontend/core_api.c
++++ b/src/libretro_frontend/core_api.c
+@@ -104,6 +104,10 @@ struct retro_core_t core_exports = {
+ };
+ 
+ void wrap_retro_run(void) {
++	static int s_run_count = 0;
++	if (s_run_count < 10) {
++		xlog("[FRONTEND] wrap_retro_run frame %d\n", s_run_count++);
++	}
+ 	// Disable the osd message after 2 seconds
+ 	if (gb_temporary_osd) {
+ 		if (os_get_tick_count() - g_osd_time > 1000) {
+@@ -170,62 +174,173 @@ static void call_dtors()
+ 	}
+ }
+ 
++#define LOADER_ADDR 0x80001500
++typedef void (*loader_func_t)(const char *path, int load_state);
++static const loader_func_t direct_loader = (loader_func_t)LOADER_ADDR;
++
++static inline void clear_snd_task_flags(void) {
++	g_snd_task_flags = 0;
++#if defined(GB300V2)
++	*(volatile int *)0x80c5ab64 = 0;
++#else
++	*(volatile int *)0x80c0b574 = 0;
++#endif
++}
++
+ // Wrap run_game for FrogUI or other menu cores so we can unload game and deinit
+ void wrap_run_game(const char *filename, int load_state) {
+ 	wrap_retro_unload_game();
+ 	wrap_retro_deinit();
+-	run_game(filename, load_state);
++	clear_snd_task_flags();
++	direct_loader(filename, load_state);
++	while (1) {
++		dly_tsk(100);
++	}
++}
++
++static void get_menu_rom_info(const char **out_name, const char **out_path) {
++	// The stock run_game() dispatches on the path's extension, so the menu
++	// must be launched through a ".gba"-suffixed stub (as the original
++	// multicore code did with "menu;p.gba"). On this card the stub exists
++	// as /mnt/sda1/ROMS/menu;m.gba and resolves to cores/menu/core_87000000.
++	const char *menu_file = "menu;m.gba";
++	const char *menu_path = "/mnt/sda1/ROMS/menu;m.gba";
++
++	if (fs_access(menu_path, 0) != 0) {
++		// Fallbacks without the .gba stub
++		menu_file = "menu;menu;m.gba";
++		menu_path = "/mnt/sda1/ROMS/menu/m";
++
++		if (fs_access(menu_path, 0) != 0) {
++			if (fs_access("/mnt/sda1/roms/menu/m", 0) == 0) {
++				menu_file = "menu;menu;m.gba";
++				menu_path = "/mnt/sda1/roms/menu/m";
++			}
++			else if (fs_access("/mnt/sda1/ROMS/menu;p.gba", 0) == 0) {
++				menu_file = "menu;p.gba";
++				menu_path = "/mnt/sda1/ROMS/menu;p.gba";
++			}
++		}
++	}
++
++	if (out_name) *out_name = menu_file;
++	if (out_path) *out_path = menu_path;
+ }
+ 
+-// Run the Menu core as a method of exiting
++// Run the Menu core as a method of exiting.
++// This is the official multicore exit path: unload the game, deinit the core
++// and launch the FrogUI menu core through the stock run_game() launcher.
++// Must only be called from firmware context (correct $gp), e.g. from
++// dummy_run_emulator_menu() or after JavaTask has been unwound.
+ void shutdown_game(void) {
++	static bool s_in_shutdown = false;
++	if (s_in_shutdown) {
++		xlog("[SHUTDOWN] Already in shutdown, skipping\n");
++		return;
++	}
++	s_in_shutdown = true;
++
+ 	// Unload the game before anything else to preserve framebuffer
+ 	wrap_retro_unload_game();
+ 
+-	// Init a black framebuffer to black out the screen before loading a new game
+-    size_t framebuffer_size = 640 * 480 * sizeof(uint16_t);
+-    uint16_t* framebuffer = (uint16_t*)malloc(framebuffer_size);
+-    memset(framebuffer, 0x0000, framebuffer_size);
+-	uint16_t pixel_pitch = 640 * sizeof(uint16_t);
+-
+-	// Write framebuffer to screen then free it
+-	run_screen_write(framebuffer, 640, 480, pixel_pitch); // Is this the proper way to do this?
+-	free(framebuffer);
++	// Black out the screen before loading the menu
++	size_t framebuffer_size = 640 * 480 * sizeof(uint16_t);
++	uint16_t *framebuffer = (uint16_t *)malloc(framebuffer_size);
++	if (framebuffer) {
++		memset(framebuffer, 0, framebuffer_size);
++		run_screen_write(framebuffer, 640, 480, 640 * sizeof(uint16_t));
++		free(framebuffer);
++	}
+ 
+-	// Prepare the loader to load the menu
+-	strcpy(ptr_gs_run_game_file, "menu;p.gba");
++	// Prepare the loader to load the menu core
++	const char *menu_name = NULL;
++	const char *menu_path = NULL;
++	get_menu_rom_info(&menu_name, &menu_path);
++	strcpy(ptr_gs_run_game_file, menu_name);
+ 	strcpy(ptr_gs_run_game_name, "FrogUI");
+ 
+ 	// Deinit before running the menu
+ 	wrap_retro_deinit();
+-	run_game("/mnt/sda1/ROMS/menu;p.gba", 0);
++	clear_snd_task_flags();
++
++	// Clear any pending joy state: if the firmware sees SELECT+START (9) still
++	// held while the menu core starts, it immediately triggers the pause/quit
++	// flow and the menu ends up reloading in a loop with a black screen.
++	g_joy_task_state = 0;
++	g_joy_state = 0;
++
++	xlog("[SHUTDOWN] Launching menu core: %s (joy=0x%08x)\n", menu_path, g_joy_task_state);
++	run_game(menu_path, 0);
++
++	// run_game() should never return; safety net just in case
++	while (1) {
++		dly_tsk(100);
++	}
+ }
+ 
+ // Patch pause menu
+-int dummy_run_emulator_menu(void) {
+-	save_srm(0); // Save before loading the pause menu (incase of crashes + replace savesrm hotkey)
+-
+-	// Save a copy of the framebuffer before opening
+-	// Needed for save states
++//
++// History: this hook used to call run_emulator_menu() (the firmware pause
++// menu) after saving the SRM and snapshotting the framebuffer, exactly as
++// upstream does. At some point the run_emulator_menu() call was dropped and
++// replaced by a direct shutdown_game(), which made SELECT+START exit to FrogUI
++// immediately on every core instead of opening a menu. The comment claimed
++// this was "J2ME core only" but nothing ever checked library_name, so it
++// applied to all cores - fheroes2 included.
++//
++// Restored for fheroes2 only: the firmware pause menu is what
++// state_framebuffer below exists for, and without it save states were being
++// written from a NULL buffer (wrap_state_save and the autosave path both
++// no-op on `if (state_framebuffer)`).
++/* Opens the stock firmware pause menu (Resume / Reboot / Save / Load).
++ *
++ * Exported so that cores which handle SELECT+START on their own (the J2ME
++ * core unwinds its Java task before the firmware ever reaches
++ * dummy_run_emulator_menu) get the exact same behaviour, including the
++ * framebuffer snapshot that state_save() needs. Returning 0 means "resume".
++ */
++int frontend_open_pause_menu(void) {
++	unsigned int response;
++
++	save_srm(0); // Save before loading the pause menu (in case of crashes)
++
++	// Snapshot the framebuffer. run_emulator_menu() draws over it, and this
++	// copy is what state_save() writes out later - so it must be taken before
++	// the menu opens. Also fixes the autosave path, which previously found
++	// state_framebuffer NULL here and skipped saving entirely.
+ 	state_fb_width = g_run_osd_width;
+ 	state_fb_height = g_run_osd_height;
+-    state_framebuffer_size = state_fb_width * state_fb_height * 2;
+-    state_framebuffer = malloc(state_framebuffer_size);
+-    memcpy(state_framebuffer, gp_run_osd_data, state_framebuffer_size);
++	state_framebuffer_size = state_fb_width * state_fb_height * 2;
++	free(state_framebuffer);
++	state_framebuffer = malloc(state_framebuffer_size);
++	if (state_framebuffer) {
++		memcpy(state_framebuffer, gp_run_osd_data, state_framebuffer_size);
++	}
++	else {
++		xlog("[MENU] malloc(%lu) for framebuffer copy failed\n",
++		     (unsigned long)state_framebuffer_size);
++	}
+ 
+-	unsigned int run_emulator_menu_response = run_emulator_menu();
+-	if (g_enable_frogui_patch) {
+-		if (run_emulator_menu_response == 1) { // Replace quit button
+-			shutdown_game();
+-		}
+-		free(state_framebuffer);
+-		state_framebuffer = NULL;
+-		return 0;
+-	} else {
+-		free(state_framebuffer);
+-		state_framebuffer = NULL;
+-		return run_emulator_menu_response;
++	response = (unsigned int)run_emulator_menu();
++	xlog("[MENU] pause menu response = %u\n", response);
++
++	free(state_framebuffer);
++	state_framebuffer = NULL;
++
++	if (g_enable_frogui_patch && response == 1) {
++		shutdown_game();	// "quit" button -> FrogUI
+ 	}
++	return (int)response;
++}
++
++int dummy_run_emulator_menu(void) {
++	// Every core opens the firmware pause menu (Resume / Reboot / Save / Load).
++	// Previously this hook was hardcoded to fheroes2 only and every other core
++	// exited straight to FrogUI, so SELECT+START never showed the menu
++	// anywhere else.
++	xlog("[MENU] %s: SELECT+START -> opening firmware pause menu\n",
++	     sysinfo.library_name ? sysinfo.library_name : "(unknown core)");
++	return frontend_open_pause_menu();
+ }
+ 
+ // __core_entry__ must be placed at a known location in the binary (at the beginning)
+@@ -248,6 +363,8 @@ struct retro_core_t *__core_entry__(void)
+ 	os_enable_interrupt();
+ 	clear_bss();
+ 
++	xlog("[FRONTEND] __core_entry__ bss cleared\n");
++
+ 	extern void __sinit (struct _reent *);
+ 	extern void __libc_init_array (void);
+ 
+@@ -379,15 +496,30 @@ void dump_zip_header(const char *zip_path, bool is_wqw, uint32_t preview_size, z
+     fclose(zip_file);
+ }
+ 
++/* Content stubs for cores that do not need a real ROM file. The console's
++   loader derives the ROM path from its own bookkeeping rather than from the
++   file we placed on the SD card, so the name it hands us is not always the one
++   we deployed. Instead of bailing out (which leaves the console on a black
++   screen forever), fall back to the stub shipped next to the core. */
++static const char *fallback_rom_path = ROMS_DIRECTORY "/classicube/classicube.gba";
++
+ bool wrap_retro_load_game(const struct retro_game_info* info) {
+ 	memcpy(&saved_game_info, info, sizeof(struct retro_game_info)); // Save the retro_game_info
+ 	xlog("core=%s-%s need_fullpath=%d\n", sysinfo.library_name, sysinfo.library_version, sysinfo.need_fullpath); // Log info
+ 
++	const char *rom_path = info->path;
++
+ 	// Check if the file exists (if the core expects it to exist)
+-	FILE *hfile = fopen(info->path, "rb");
++	FILE *hfile = fopen(rom_path, "rb");
+ 	if (!hfile) {
+-		xlog("[core] Error opening rom file=%s\n", info->path);
+-		return false;
++		xlog("[core] rom not found (%s), trying fallback stub\n", rom_path);
++		hfile = fopen(fallback_rom_path, "rb");
++		if (hfile) {
++			xlog("[core] using fallback stub %s\n", fallback_rom_path);
++			rom_path = fallback_rom_path;
++		} else {
++			xlog("[core] fallback stub missing too, continuing with empty content\n");
++		}
+ 	}
+ 
+ 	// setup load/save state handlers
+@@ -402,32 +534,35 @@ bool wrap_retro_load_game(const struct retro_game_info* info) {
+ 	retro_set_audio_sample(mono_mix_audio_sample_cb);
+ 	retro_set_audio_sample_batch(mono_mix_audio_batch_cb);
+ 
+-	void *buffer;
+-	long size;
++	void *buffer = NULL;
++	long size = 0;
+ 	char *dir = NULL;
+     char *filename = NULL;
+     char *extension = NULL;
+-	bool is_wqw;
++	bool is_wqw = false;
+ 	bool core_supports_rom_in_buffer = false;
+ 	zip_local_file_header zip_header;
+ 
+-	extract_path_components(info->path, &dir, &filename, &extension);
++	extract_path_components(rom_path, &dir, &filename, &extension);
+ 	core_supports_rom_in_buffer = extension_supports_no_fullpath(extension);
+ 
+-	if (is_zip_wqw_file(info->path, &is_wqw)) {
++	if (!hfile) {
++		/* No content at all: hand the core empty buffers and let it decide. */
++		game_info_ext.file_in_archive = false;
++	} else if (is_zip_wqw_file(rom_path, &is_wqw)) {
+ 		g_preview_size = 0;
+ 		if (is_wqw) g_preview_size = g_preview_height * g_preview_width * 2;
+-		dump_zip_header(info->path, is_wqw, g_preview_size, &zip_header);
++		dump_zip_header(rom_path, is_wqw, g_preview_size, &zip_header);
+ 		size = zip_header.uncompressed_size;
+ 		// Extended game info
+ 		game_info_ext.file_in_archive = true;
+-		game_info_ext.archive_path = info->path;
++		game_info_ext.archive_path = rom_path;
+ 		game_info_ext.archive_file = zip_header.filename;
+ 		extract_extension(zip_header.filename, &extension);
+ 		core_supports_rom_in_buffer = extension_supports_no_fullpath(extension);
+ 		if (!sysinfo.need_fullpath || core_supports_rom_in_buffer) {
+ 			buffer = malloc(size);
+-			unzip_file(info->path, buffer, is_wqw, g_preview_size);
++			unzip_file(rom_path, buffer, is_wqw, g_preview_size);
+ 		}
+ 	} else {
+ 		fseeko(hfile, 0, SEEK_END);
+@@ -445,8 +580,8 @@ bool wrap_retro_load_game(const struct retro_game_info* info) {
+ 	if (sysinfo.need_fullpath && !core_supports_rom_in_buffer) xlog("core loads content directly from file\n");
+ 
+ 	struct retro_game_info gameinfo;
+-	gameinfo.path = info->path;
+-	if (!sysinfo.need_fullpath || core_supports_rom_in_buffer) {
++	gameinfo.path = rom_path;
++	if ((!sysinfo.need_fullpath || core_supports_rom_in_buffer) && buffer) {
+ 		gameinfo.data = buffer;
+ 		xlog("game loaded into temp buffer. size=%u\n", size);
+ 	} else gameinfo.data = info->data;
+@@ -454,7 +589,7 @@ bool wrap_retro_load_game(const struct retro_game_info* info) {
+ 
+ 	// Extended game info
+ 	game_info_ext.persistent_data = false;
+-	game_info_ext.full_path = info->path;
++	game_info_ext.full_path = rom_path;
+ 	if (!sysinfo.need_fullpath || core_supports_rom_in_buffer) game_info_ext.data = buffer;
+ 	game_info_ext.size = size;
+ 	game_info_ext.dir = dir;
+@@ -764,6 +899,7 @@ int state_save(int save_slot, uint16_t* emu_fb, uint32_t fb_width, uint32_t fb_h
+ }
+ 
+ void wrap_retro_init(void) {	
++	xlog("[FRONTEND] wrap_retro_init enter\n");
+ 	retro_get_system_info(&sysinfo);
+ 	snprintf(assets_dir, sizeof(assets_dir), "%s/%s", ASSETS_DIRECTORY, sysinfo.library_name);
+ 	config_load(&s_core_config, ptr_gs_run_game_file, sysinfo.library_name); // Load configs
+@@ -868,10 +1004,7 @@ static void frameskip_cb(BOOL flag) {
+ }
+ 
+ static void failed_retro_run(void) {
+-	// Prepare the loader and load the menu
+-	strcpy(ptr_gs_run_game_file, "menu;p.gba");
+-	strcpy(ptr_gs_run_game_name, "FrogUI");
+-	run_game("/mnt/sda1/ROMS/menu;p.gba", 0);
++	shutdown_game();
+ }
+ 
+ void darken_rgb565_buffer(const void* buffer, unsigned width, unsigned height, size_t pitch_bytes, uint8_t darken_percentage) {
+diff --git a/src/libretro_frontend/file.c b/src/libretro_frontend/file.c
+index 26c880d..500d8e2 100644
+--- a/src/libretro_frontend/file.c
++++ b/src/libretro_frontend/file.c
+@@ -4,6 +4,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <sys/time.h>
++#include <time.h>
+ 
+ #include <deimos.h>
+ #include <file.h>
+@@ -51,6 +53,41 @@ void extract_path_components(const char *filepath, char **dir, char **filename,
+ }
+ 
+ /*		SRM Files		*/
++/* Cores that generate a fresh world on every launch (ClassiCube on SF2000
++   does) would otherwise derive the save file name from the mangled ROM path
++   the firmware hands us - e.g. "mc.srm" - and overwrite the previous world's
++   save. Give each session its own random world name instead, derived from the
++   core name so the files stay identifiable, and generated once per session so
++   that saving and loading stay consistent within a run. */
++static char srm_basename[MAXPATH];
++
++static void init_srm_basename(void) {
++	struct timeval tv;
++	uint32_t seed;
++	char suffix[17];
++	int i;
++
++	if (srm_basename[0]) return;
++
++	if (gettimeofday(&tv, NULL) != 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
++	/* gettimeofday() gives real sub-second resolution here (Stopwatch_Measure
++	   relies on it), so the boot time already varies per session. */
++	seed = (uint32_t)tv.tv_sec * 2654435761u ^ ((uint32_t)tv.tv_usec << 8);
++
++	/* xorshift, so the name is not a trivial function of the timestamp */
++	for (i = 0; i < 8; i++) {
++		seed ^= seed << 13;
++		seed ^= seed >> 17;
++		seed ^= seed << 5;
++		suffix[i * 2]     = 'a' + (char)(seed % 26);
++		suffix[i * 2 + 1] = '0' + (char)((seed >> 8) % 10);
++	}
++	suffix[16] = '\0';
++
++	snprintf(srm_basename, MAXPATH, "%s-%s", sysinfo.library_name, suffix);
++	frontend_log_cb(RETRO_LOG_INFO, "FRONTEND", "random world name: %s\n", srm_basename);
++}
++
+ static void build_srm_filepath(char *filepath, size_t size, const char *basename, const char *extension, int slot, const char * type) {
+     char ext[5];
+     if (slot) snprintf(ext, 5, "%s%d", extension, slot);
+@@ -72,8 +109,8 @@ void save_srm(int slot) {
+     char ram_filepath[MAXPATH];
+ 
+     char basename[MAXPATH];
+-	fill_pathname_base(basename, saved_game_info.path, sizeof(basename));
+-	path_remove_extension(basename);
++	init_srm_basename();
++	snprintf(basename, sizeof(basename), "%s", srm_basename);
+ 
+     // Save SRM
+     build_srm_filepath(ram_filepath, sizeof(ram_filepath), basename, "srm", slot, "Save");
+@@ -100,8 +137,8 @@ void load_srm(int slot) {
+     char ram_filepath[MAXPATH];
+ 
+     char basename[MAXPATH];
+-	fill_pathname_base(basename, saved_game_info.path, sizeof(basename));
+-	path_remove_extension(basename);
++	init_srm_basename();
++	snprintf(basename, sizeof(basename), "%s", srm_basename);
+ 
+     // Load SRM
+     build_srm_filepath(ram_filepath, sizeof(ram_filepath), basename, "srm", slot, "Load");
+diff --git a/src/libretro_frontend/lib.c b/src/libretro_frontend/lib.c
+index f9a8a14..5cb8778 100644
+--- a/src/libretro_frontend/lib.c
++++ b/src/libretro_frontend/lib.c
+@@ -65,22 +65,65 @@ void *sbrk(ptrdiff_t incr)
+ 	if (!s_heap_ptr)
+ 	{
+ 		s_heap_ptr = gp_buf_64m;	// use stock's 64MB scratch buffer
+-		s_heap_end = gp_buf_64m + 0x4000000;
++		// GB300 has only ~64MB of RAM in total, so leave headroom for the
++		// firmware/OS and use at most 48MB of it for the emulator heap.
++		s_heap_end = (void*)((char*)gp_buf_64m + 0x3400000);
++		xlog("sbrk init: heap_base=%p heap_end=%p (52MB)\n", s_heap_ptr, s_heap_end);
+ 	}
+ 
+ 	void *curr_ptr = s_heap_ptr;
+-	void *new_ptr = s_heap_ptr + incr;
++	void *new_ptr = (void*)((char*)s_heap_ptr + incr);
+ 
+-	if (new_ptr >= s_heap_end)
+-		lcd_bsod("sbrk: out of memory");
++	if (new_ptr > s_heap_end || new_ptr < gp_buf_64m)
++	{
++		xlog("sbrk OOM: curr=%p incr=%d end=%p used=%u KB\n",
++			curr_ptr, (int)incr, s_heap_end, (unsigned)(((char*)curr_ptr - (char*)gp_buf_64m) / 1024));
++		return (void*)-1;
++	}
+ 
+ 	s_heap_ptr = new_ptr;
+ 
+-// __xlog("sbrk: ret=%p incr=%d s_heap_ptr=%p\n", curr_ptr, (int)incr, s_heap_ptr);
+-	
++	if (incr >= 512 * 1024 || incr <= -512 * 1024) {
++		unsigned ra;
++		asm volatile ("move %0, $ra" : "=r" (ra));
++		xlog("sbrk big: incr=%d used=%u KB ra=0x%08x\n", (int)incr, (unsigned)(((char*)s_heap_ptr - (char*)gp_buf_64m) / 1024), ra);
++	}
++
+ 	return curr_ptr;
+ }
+ 
++// free() tracer. The emulator aborted inside newlib's _free_r with an address
++// error, which means free() received either a misaligned pointer or one that
++// never came from malloc (leaving _free_r to chase a garbage chunk header).
++// Log such calls together with the caller's return address so the offending
++// code can be identified from the log. The link uses --wrap=free.
++void __real_free(void *ptr) __attribute__((weak));
++
++__attribute__((noinline)) void __wrap_free(void *ptr)
++{
++	if (ptr)
++	{
++		unsigned long p = (unsigned long)ptr;
++		unsigned long heap_beg = (unsigned long)gp_buf_64m;
++		unsigned long heap_end = heap_beg + 0x4000000;
++
++		if (((p & 7) != 0) || (p < heap_beg) || (p >= heap_end))
++		{
++			unsigned ra;
++			asm volatile ("move %0, $ra" : "=r" (ra));
++
++			unsigned size_word = 0;
++			if ((p & 3) == 0)
++				size_word = *(volatile unsigned *)(p - 4);
++
++			xlog("[FREE-TRACE] invalid ptr=%p ra=%p size=0x%08X heap=[%p,%p)\n",
++				ptr, (void *)ra, size_word, (void *)heap_beg, (void *)heap_end);
++		}
++	}
++
++	__real_free(ptr);
++}
++
+ int open(const char *path, int flags, ...)
+ {
+ 	int fs_flags = 0;
+@@ -93,84 +136,75 @@ int open(const char *path, int flags, ...)
+ 	if (flags & O_CREAT)  fs_flags |= FS_O_CREAT;
+ 	if (flags & O_TRUNC)  fs_flags |= FS_O_TRUNC;
+ 
+-// __xlog("open: path=%s flags=%d fs_flags=%d\n", path, flags, fs_flags);
+-
+-int ret = fs_open(path, fs_flags, fs_perms);
+-	if (ret < 0)
+-		errno = g_errno;
+-	else
+-		ret += 5;
+-
+-// __xlog("open: ret=%d\n", ret);
+-	return ret;
++	int ret = fs_open(path, fs_flags, fs_perms);
++	if (ret < 0) {
++		errno = g_errno ? g_errno : ENOENT;
++		return -1;
++	}
++	return ret + 5;
+ }
+ 
+ ssize_t read(int fd, void *buf, size_t count)
+ {
+-if (fd == 0 || fd == 1 || fd == 2)
++	if (fd < 5)
+ 		return 0;
+ 
+ 	fd -= 5;
+-
+-// __xlog("read: fd=%d buf=%p count=%u\n", fd, buf, count);
+ 	ssize_t ret = fs_read(fd, buf, count);
+-	if (ret < 0)
+-		errno = g_errno;
+-// __xlog("read: ret=%d\n", ret);
++	if (ret < 0) {
++		errno = g_errno ? g_errno : EIO;
++		return -1;
++	}
+ 	return ret;
+ }
+ 
+ ssize_t write(int fd, const void *buf, size_t count)
+ {
+-	if (fd == 0)
++	if (fd <= 0)
+ 		return -1;
+ 	else if (fd == 1 || fd == 2)
+ 	{
+ 		xlog("%.*s", count, buf);
+ 		return count;
+ 	}
++	else if (fd < 5)
++		return -1;
+ 
+ 	fd -= 5;
+-
+-// __xlog("write: fd=%d buf=%p count=%u\n", fd, buf, count);
+ 	ssize_t ret = fs_write(fd, buf, count);
+-	if (ret < 0)
+-		errno = g_errno;
+-// __xlog("write: ret=%d\n", ret);
++	if (ret < 0) {
++		errno = g_errno ? g_errno : EIO;
++		return -1;
++	}
+ 	return ret;
+ }
+ 
+ off_t lseek(int fd, off_t offset, int whence)
+ {
+-	if (fd == 0 || fd == 1 || fd == 2)
++	if (fd < 5)
+ 		return -1;
+ 
+-// __xlog("lseek: fd=%d offset=%d whence=%d\n", fd, (int)offset, whence);
+-
+ 	fd -= 5;
+-
+ 	int64_t ret = fs_lseek(fd, offset, whence);
+-	if (ret < 0)
+-		errno = g_errno;
+-// __xlog("lseek: ret=%d\n", (int)ret);
+-
++	if (ret < 0) {
++		errno = g_errno ? g_errno : EINVAL;
++		return -1;
++	}
+ 	return ret;
+ }
+ 
+ int close(int fd)
+ {
+-	if (fd == 0 || fd == 1 || fd == 2)
+-		return -1;
+-
+-// __xlog("close: fd=%d\n", fd);
++	if (fd < 5)
++		return 0;
+ 
+ 	fd -= 5;
+-
+ 	int ret = fs_close(fd);
+-	if (ret < 0)
++	if (ret < 0) {
+ 		errno = g_errno;
+-// __xlog("close: ret=%d\n", ret);
+-	return ret;
++		return -1;
++	}
++	return 0;
+ }
+ 
+ typedef struct {
+@@ -211,6 +245,9 @@ int	stat(const char *path, struct stat *sbuf)
+ 
+ int	fstat(int fd, struct stat *sbuf)
+ {
++	if (fd < 5)
++		return -1;
++	fd -= 5;
+ 	fs_stat_t buffer = {0};
+ 	int ret = fs_fstat(fd, &buffer);
+ 	return stat_common(ret, &buffer, sbuf);
+diff --git a/stub-generator/index.js b/stub-generator/index.js
+index f61cd60..b5febf5 100644
+--- a/stub-generator/index.js
++++ b/stub-generator/index.js
+@@ -705,6 +705,7 @@ async function extensionSelector(title, additionalLines, core){
+         dblcherrygb: "gb gbc sgb",
+         fake08: "p8 png",
+         fcf: "bin rom chf",
++        fheroes2: "agg mp2 mx2",
+         flashback: "map aba seq lev",
+         gb: "gb dmg gbc cgb sgb",
+         gba: "gba bin agb gbz u1",

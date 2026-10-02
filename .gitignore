@@ -1,0 +1,18 @@
+# build output
+build/
+dist/
+*.o
+*.a
+*.so
+core_87000000
+core_87000000_SF2000
+core_87000000_GB300V2
+classicube_libretro.so
+classicube_libretro_sf2000.a
+test_runner
+
+# scratch output from the test runner
+frames/
+
+# nested upstream checkouts (vendored contents are committed, not the .git)
+.git/

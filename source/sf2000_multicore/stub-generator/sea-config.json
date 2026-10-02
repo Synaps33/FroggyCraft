@@ -1,0 +1,5 @@
+{
+	"main": "./temp/bundle.js",
+	"output": "./temp/modern-stub.blob",
+	"disableExperimentalSEAWarning": true
+}
